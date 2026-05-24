@@ -1,4 +1,4 @@
-import os
+import sys
 from pathlib import Path
 
 import streamlit as st
@@ -9,13 +9,15 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
+sys.path.insert(0, str(Path(__file__).parent))
+from ingest import get_registry, ingest_ticker, is_ingested, load_vectorstore
+from sp500 import display_options, get_sp500, parse_selection
+
 load_dotenv(override=True)
 
-CHROMA_DIR = Path(__file__).resolve().parent.parent / "chroma_db"
-
 SYSTEM_PROMPT = """You are a financial analyst assistant. Use the retrieved context \
-from SEC filings to answer questions accurately and concisely. If the answer is not \
-in the context, say so — do not fabricate figures or facts.
+from SEC filings to answer questions accurately and concisely. Cite specific figures \
+when available. If the answer is not in the context, say so — do not fabricate data.
 
 Context:
 {context}"""
@@ -25,85 +27,189 @@ def format_docs(docs: list) -> str:
     return "\n\n".join(doc.page_content for doc in docs)
 
 
-@st.cache_resource(show_spinner="Loading vectorstore...")
-def load_chain():
+@st.cache_resource
+def build_chain(collection_name: str):
+    """Build and cache a RAG chain for a given ChromaDB collection."""
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
     vectorstore = Chroma(
-        persist_directory=str(CHROMA_DIR),
+        collection_name=collection_name,
+        persist_directory=str(Path(__file__).resolve().parent.parent / "chroma_db"),
         embedding_function=embeddings,
     )
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 12})
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
         ("human", "{input}"),
     ])
-
     answer_chain = (
         {"context": lambda x: format_docs(x["context"]), "input": lambda x: x["input"]}
-        | prompt
-        | llm
-        | StrOutputParser()
+        | prompt | llm | StrOutputParser()
+    )
+    return RunnableParallel(
+        {"context": retriever, "input": RunnablePassthrough()}
+    ).assign(answer=answer_chain)
+
+
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="Financial RAG Assistant",
+    page_icon="📈",
+    layout="wide",
+)
+
+# ---------------------------------------------------------------------------
+# Sidebar — company selector
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    st.title("📈 Financial RAG Assistant")
+    st.caption("Powered by SEC EDGAR · LangChain · ChromaDB · OpenAI")
+    st.divider()
+
+    with st.spinner("Loading S&P 500 list..."):
+        companies = get_sp500()
+
+    options = display_options(companies)
+
+    # Default to Apple if it's in the list
+    default_label = next(
+        (o for o in options if "(AAPL)" in o),
+        options[0],
+    )
+    default_idx = options.index(default_label)
+
+    selected = st.selectbox(
+        "Company",
+        options,
+        index=default_idx,
+        help="Search by company name or ticker",
+    )
+    ticker, company_name = parse_selection(selected)
+
+    form_type = st.radio(
+        "Filing type",
+        ["10-Q", "10-K"],
+        horizontal=True,
+        help="10-Q = latest quarterly report · 10-K = latest annual report",
     )
 
-    return (
-        RunnableParallel({"context": retriever, "input": RunnablePassthrough()})
-        .assign(answer=answer_chain)
-    )
+    st.divider()
 
+    # Registry status
+    registry = get_registry()
+    from ingest import collection_name as col_name_fn
+    col = col_name_fn(ticker, form_type)
+    already_ingested = col in registry
 
-st.set_page_config(page_title="Financial RAG Assistant", page_icon="📈", layout="centered")
-st.title("📈 Financial RAG Assistant")
-st.caption("Ask questions about Apple's 10-Q (Q2 FY2026, period ended March 28, 2026)")
+    if already_ingested:
+        entry = registry[col]
+        st.success(f"**Ingested**")
+        st.caption(
+            f"Period: {entry.get('report_date', '?')}  \n"
+            f"Filed: {entry.get('filing_date', '?')}  \n"
+            f"Chunks: {entry.get('chunks', '?')}"
+        )
+    else:
+        st.info(f"Not yet ingested")
 
-if "messages" in st.session_state and st.session_state.messages:
-    if st.button("Clear chat", type="secondary"):
-        st.session_state.messages = []
-        st.rerun()
+    st.divider()
+    st.caption("All ingested companies")
+    if registry:
+        for k, v in registry.items():
+            st.caption(f"• {v.get('company_name', k)} ({v.get('form_type', '?')})")
+    else:
+        st.caption("None yet")
 
-if "messages" not in st.session_state:
+# ---------------------------------------------------------------------------
+# Detect company switch → reset chat
+# ---------------------------------------------------------------------------
+
+company_key = f"{ticker}_{form_type}"
+if st.session_state.get("company_key") != company_key:
+    st.session_state.company_key = company_key
     st.session_state.messages = []
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if msg["role"] == "assistant" and msg.get("sources"):
-            with st.expander("Sources"):
-                for doc in msg["sources"]:
-                    page = doc.metadata.get("page", "?")
-                    source = doc.metadata.get("source", "unknown")
-                    st.markdown(f"**Page {page + 1}** — `{Path(source).name}`")
-                    st.caption(doc.page_content[:300] + "...")
+# ---------------------------------------------------------------------------
+# Main area
+# ---------------------------------------------------------------------------
 
-query = st.chat_input("Ask a question about the filing...")
+st.header(f"{company_name} — {form_type}")
 
-if query:
-    st.session_state.messages.append({"role": "user", "content": query})
-    with st.chat_message("user"):
-        st.markdown(query)
+if not already_ingested:
+    st.info(
+        f"**{company_name} ({ticker})** has not been ingested yet.\n\n"
+        f"Click below to download the latest {form_type} from SEC EDGAR and build the index. "
+        f"This takes about 30–60 seconds."
+    )
+    if st.button(f"⬇️ Ingest {ticker} {form_type}", type="primary"):
+        progress_lines = st.empty()
+        log: list[str] = []
 
-    chain = load_chain()
+        def update_progress(msg: str):
+            log.append(msg)
+            progress_lines.markdown("\n\n".join(f"• {l}" for l in log))
 
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            result = chain.invoke(query)
+        try:
+            with st.spinner(f"Ingesting {ticker} {form_type}..."):
+                ingest_ticker(ticker, form_type, progress_cb=update_progress)
+            st.success("Ingestion complete! You can now ask questions.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Ingestion failed: {e}")
+else:
+    # Chat interface
+    entry = registry[col]
+    st.caption(
+        f"Filing period: **{entry.get('report_date', '?')}**  ·  "
+        f"Filed: **{entry.get('filing_date', '?')}**  ·  "
+        f"{entry.get('chunks', '?')} indexed chunks"
+    )
 
-        answer = result["answer"]
-        sources = result.get("context", [])
+    if st.session_state.messages:
+        if st.button("Clear chat", type="secondary"):
+            st.session_state.messages = []
+            st.rerun()
 
-        st.markdown(answer)
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg["role"] == "assistant" and msg.get("sources"):
+                with st.expander("Sources"):
+                    for doc in msg["sources"]:
+                        page = doc.metadata.get("page", "?")
+                        source = doc.metadata.get("source", "")
+                        st.markdown(f"**Page {page + 1}** — `{Path(source).name}`")
+                        st.caption(doc.page_content[:300] + "...")
 
-        if sources:
-            with st.expander("Sources"):
-                for doc in sources:
-                    page = doc.metadata.get("page", "?")
-                    source = doc.metadata.get("source", "unknown")
-                    st.markdown(f"**Page {page + 1}** — `{Path(source).name}`")
-                    st.caption(doc.page_content[:300] + "...")
+    query = st.chat_input(f"Ask about {company_name}'s {form_type}...")
 
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": answer,
-        "sources": sources,
-    })
+    if query:
+        st.session_state.messages.append({"role": "user", "content": query})
+        with st.chat_message("user"):
+            st.markdown(query)
+
+        chain = build_chain(col)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                result = chain.invoke(query)
+            answer = result["answer"]
+            sources = result.get("context", [])
+            st.markdown(answer)
+            if sources:
+                with st.expander("Sources"):
+                    for doc in sources:
+                        page = doc.metadata.get("page", "?")
+                        source = doc.metadata.get("source", "")
+                        st.markdown(f"**Page {page + 1}** — `{Path(source).name}`")
+                        st.caption(doc.page_content[:300] + "...")
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer,
+            "sources": sources,
+        })

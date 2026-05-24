@@ -1,0 +1,32 @@
+{
+  "aapl_10q": {
+    "ticker": "AAPL",
+    "company_name": "Apple Inc.",
+    "form_type": "10-Q",
+    "filing_date": "2026-05-01",
+    "report_date": "2026-03-28",
+    "pdf_path": "/Users/rahulbhuma/financial-rag-assistant/data/AAPL_10Q_2026-03-28.pdf",
+    "collection": "aapl_10q",
+    "chunks": 109
+  },
+  "msft_10q": {
+    "ticker": "MSFT",
+    "company_name": "MICROSOFT CORP",
+    "form_type": "10-Q",
+    "filing_date": "2026-04-29",
+    "report_date": "2026-03-31",
+    "pdf_path": "/Users/rahulbhuma/financial-rag-assistant/data/MSFT_10Q_2026-03-31.pdf",
+    "collection": "msft_10q",
+    "chunks": 275
+  },
+  "meta_10q": {
+    "ticker": "META",
+    "company_name": "Meta Platforms, Inc.",
+    "form_type": "10-Q",
+    "filing_date": "2026-04-30",
+    "report_date": "2026-03-31",
+    "pdf_path": "/Users/rahulbhuma/financial-rag-assistant/data/META_10Q_2026-03-31.pdf",
+    "collection": "meta_10q",
+    "chunks": 500
+  }
+}
