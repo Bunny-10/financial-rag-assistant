@@ -3,9 +3,7 @@ title: Financial RAG Assistant
 emoji: 📈
 colorFrom: blue
 colorTo: green
-sdk: streamlit
-sdk_version: "1.57.0"
-app_file: src/app.py
+sdk: docker
 pinned: false
 ---
 
